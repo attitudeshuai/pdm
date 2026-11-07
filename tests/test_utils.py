@@ -538,6 +538,61 @@ def test_fs_supports_link_method_when_method_doesnt_exist():
     assert utils.fs_supports_link_method("nonexistent-link-method") is False
 
 
+def test_hash_directory_tree_is_order_independent_and_stable(tmp_path):
+    (tmp_path / "b.txt").write_text("second")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a.py").write_text("first")
+    first = utils.hash_directory_tree(tmp_path)
+    # Recompute: only timestamps change, contents stay the same.
+    os.utime(tmp_path / "b.txt", (1, 1))
+    assert utils.hash_directory_tree(tmp_path) == first
+
+
+def test_hash_directory_tree_detects_content_and_rename_changes(tmp_path):
+    (tmp_path / "a.py").write_text("one")
+    before = utils.hash_directory_tree(tmp_path)
+    (tmp_path / "a.py").write_text("two")
+    assert utils.hash_directory_tree(tmp_path) != before
+    (tmp_path / "a.py").write_text("one")
+    (tmp_path / "a.py").rename(tmp_path / "b.py")
+    assert utils.hash_directory_tree(tmp_path) != before
+
+
+def test_hash_directory_tree_ignores_caches_vcs_and_build_artifacts(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    for ignored in (
+        ".git/HEAD",
+        ".hg/store/00manifest.i",
+        "__pycache__/a.cpython-313.pyc",
+        ".pytest_cache/v/cache/lastfailed",
+        "src.egg-info/SOURCES.txt",
+        "build/lib/x.py",
+        "dist/x-1.0.whl",
+        ".venv/lib/python3.13/site-packages/x.py",
+    ):
+        path = tmp_path / ignored
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ignored")
+    baseline = utils.hash_directory_tree(tmp_path)
+
+    (tmp_path / ".git/HEAD").write_text("changed-ref")
+    (tmp_path / "src.egg-info/SOURCES.txt").write_text("changed")
+    assert utils.hash_directory_tree(tmp_path) == baseline
+
+
+def test_hash_directory_tree_ignores_permission_only_changes(tmp_path):
+    path = tmp_path / "mod.py"
+    path.write_text("data")
+    before = utils.hash_directory_tree(tmp_path)
+    mode = path.stat().st_mode
+    try:
+        os.chmod(path, mode | stat.S_IROTH)
+        assert utils.hash_directory_tree(tmp_path) == before
+    finally:
+        os.chmod(path, mode)
+
+
 def test_convert_to_datetime_when_uppercase_t_is_present():
     original_datetime = "2025-10-30T10:26:29Z"
     expected_datetime = datetime.fromisoformat("2025-10-30T10:26:29+00:00")

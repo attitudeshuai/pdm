@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import importlib.metadata as im
+import json
 import os
 import re
 import warnings
@@ -33,6 +34,7 @@ from pdm.utils import (
     convert_hashes,
     filtered_sources,
     get_rev_from_url,
+    hash_directory_tree,
     normalize_name,
     url_without_fragments,
 )
@@ -44,6 +46,40 @@ if TYPE_CHECKING:
 
     from pdm._types import FileHash
     from pdm.environments import BaseEnvironment
+
+#: Name of the metadata file written into ``.dist-info`` to record the
+#: build-input digest a locally built distribution was produced from.
+LOCAL_BUILD_RECORD_FILE = "pdm_build_inputs.json"
+
+#: Version of the digest algorithm/record format. Bump it whenever either
+#: changes so that distributions recorded with an older version are rebuilt.
+LOCAL_BUILD_DIGEST_VERSION = 1
+
+
+def compute_local_build_digest(source_dir: str | Path, environment: BaseEnvironment, *, editable: bool) -> str:
+    """Compute a digest of everything that may affect a PEP 517 build of a
+    local directory.
+
+    The covered inputs are the source tree contents (project declaration,
+    build configuration/backend settings and source files; see
+    :func:`pdm.utils.hash_directory_tree`) together with the target
+    environment and the build settings PDM applies. Caches and VCS metadata
+    are not included, and file permissions/timestamps do not contribute.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(b"pdm-local-build-inputs\n")
+    hasher.update(f"version={LOCAL_BUILD_DIGEST_VERSION}\n".encode())
+    spec = environment.spec
+    hasher.update(f"env={spec.requires_python}|{spec.platform}|{spec.implementation}\n".encode())
+    hasher.update(f"interpreter={os.path.normcase(os.fspath(environment.interpreter.executable))}\n".encode())
+    hasher.update(f"editable={int(editable)}\n".encode())
+    hasher.update(f"build_isolation={int(environment.project.core.state.build_isolation)}\n".encode())
+    config_settings = environment.project.core.state.config_settings or {}
+    hasher.update(json.dumps(config_settings, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+    hasher.update(b"\n")
+    hasher.update(f"source={os.path.normcase(os.path.abspath(os.fspath(source_dir)))}\n".encode())
+    hasher.update(hash_directory_tree(source_dir).encode("ascii"))
+    return f"sha256={hasher.hexdigest()}"
 
 
 def _dist_info_files(whl_zip: ZipFile) -> list[str]:
@@ -406,6 +442,38 @@ class PreparedCandidate:
             )
         else:
             return None
+
+    def local_build_source_dir(self) -> Path | None:
+        """Return the directory the wheel is built from when the candidate is
+        a local directory requirement, otherwise None."""
+        if not self.req.is_file_or_url:
+            return None
+        if not (self.link and self.link.is_file and self._unpacked_dir and self._unpacked_dir.is_dir()):
+            return None
+        return self._unpacked_dir
+
+    def local_build_digest(self) -> str | None:
+        """Digest of the local build inputs, or None when this candidate is
+        not built from a local directory."""
+        source_dir = self.local_build_source_dir()
+        if source_dir is None:
+            return None
+        return compute_local_build_digest(source_dir, self.environment, editable=bool(self.req.editable))
+
+    def local_build_record(self) -> dict[str, bytes] | None:
+        """Return the extra dist-info metadata recording the build-input
+        digest, or None for non-local candidates."""
+        digest = self.local_build_digest()
+        if digest is None:
+            return None
+        assert self.link is not None
+        payload = {
+            "version": LOCAL_BUILD_DIGEST_VERSION,
+            "editable": bool(self.req.editable),
+            "source": self.link.url_without_fragment,
+            "digest": digest,
+        }
+        return {LOCAL_BUILD_RECORD_FILE: json.dumps(payload, indent=2).encode("utf-8")}
 
     def build(self) -> Path:
         """Call PEP 517 build hook to build the candidate into a wheel"""

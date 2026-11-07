@@ -186,9 +186,13 @@ def install_wheel(
     install_links: bool = False,
     rename_pth: bool = False,
     requested: bool = False,
+    extra_metadata: dict[str, bytes] | None = None,
 ) -> str:
     """Only create .pth files referring to the cached package.
     If the cache doesn't exist, create one.
+
+    ``extra_metadata`` is appended to the installation metadata after the
+    standard files, so its entries are the last ones written before RECORD.
     """
     interpreter = str(environment.interpreter.executable)
     script_kind = environment.script_kind
@@ -206,6 +210,8 @@ def install_wheel(
         additional_metadata["direct_url.json"] = json.dumps(direct_url, indent=2).encode()
     if requested:
         additional_metadata["REQUESTED"] = b""
+    if extra_metadata:
+        additional_metadata.update(extra_metadata)
 
     destination = InstallDestination(
         scheme_dict=environment.get_paths(dist_name),

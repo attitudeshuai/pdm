@@ -6,15 +6,21 @@ from collections.abc import Collection, Iterable
 from functools import cached_property
 from importlib.metadata import Distribution
 from itertools import chain
+from pathlib import Path
 
 from pdm import termui
 from pdm.environments import BaseEnvironment
 from pdm.exceptions import BuildError
 from pdm.installers.manager import InstallManager
-from pdm.models.candidates import Candidate
+from pdm.models.candidates import (
+    LOCAL_BUILD_DIGEST_VERSION,
+    LOCAL_BUILD_RECORD_FILE,
+    Candidate,
+    compute_local_build_digest,
+)
 from pdm.models.repositories import Package
 from pdm.models.requirements import FileRequirement, Requirement, parse_requirement, strip_extras
-from pdm.utils import is_editable, normalize_name
+from pdm.utils import is_editable, normalize_name, url_to_path
 
 
 def editables_candidate(environment: BaseEnvironment) -> Candidate | None:
@@ -149,10 +155,84 @@ class BaseSynchronizer:
             return normalize_name(name)
         return name
 
+    def _resolve_local_source_dir(self, can: Candidate) -> Path | None:
+        """Resolve the build directory of a local directory candidate
+        (taking the subdirectory fragment into account)."""
+        if not can.link or not can.link.is_file:
+            return None
+        expanded_url = self.environment.project.backend.expand_line(can.link.url_without_fragment)
+        try:
+            path = Path(url_to_path(expanded_url))
+        except ValueError:
+            return None
+        if not path.is_absolute():
+            return None
+        if can.link.subdirectory:
+            path = path / can.link.subdirectory
+        return path if path.is_dir() else None
+
+    def _artifacts_complete(self, dist: Distribution) -> bool:
+        """Check that every file recorded in the installed RECORD exists."""
+        files = list(dist.files or [])
+        if not files:
+            return False
+        for package_path in files:
+            if not dist.locate_file(package_path).exists():
+                termui.logger.info(
+                    "Installed artifact %s of %s is missing, the distribution will be rebuilt.",
+                    package_path,
+                    dist.metadata.get("Name"),
+                )
+                return False
+        return True
+
+    def _local_build_is_current(self, dist: Distribution, source_dir: Path, *, editable: bool) -> bool:
+        """Whether a distribution built from a local directory is still up to
+        date: the recorded build-input digest must match the current inputs
+        and the installed artifacts must be complete."""
+        record_text = dist.read_text(LOCAL_BUILD_RECORD_FILE)
+        if not record_text:
+            # Installed by an older PDM (or before the build finished):
+            # rebuild once and record the digest afterwards.
+            return False
+        try:
+            record = json.loads(record_text)
+        except ValueError:
+            termui.logger.warning(
+                "Invalid %s found for %s, the distribution will be rebuilt.",
+                LOCAL_BUILD_RECORD_FILE,
+                dist.metadata.get("Name"),
+            )
+            return False
+        if not isinstance(record, dict) or record.get("version") != LOCAL_BUILD_DIGEST_VERSION:
+            # The digest algorithm/record format changed, rebuild is needed.
+            return False
+        try:
+            digest = compute_local_build_digest(source_dir, self.environment, editable=editable)
+        except OSError as e:
+            termui.logger.warning(
+                "Failed to compute the build digest of %s: %s; the distribution will be rebuilt.",
+                source_dir,
+                e,
+            )
+            return False
+        if record.get("digest") != digest:
+            return False
+        return self._artifacts_complete(dist)
+
     def _should_update(self, dist: Distribution, can: Candidate) -> bool:
         """Check if the candidate should be updated"""
         backend = self.environment.project.backend
-        if self.reinstall or can.req.editable:  # Always update if incoming is editable
+        if self.reinstall:  # Forced reinstallation always rebuilds everything.
+            return True
+        if can.req.editable:
+            if not can.req.is_vcs and is_editable(dist):
+                # Editable builds of local directories can be skipped when
+                # their build inputs didn't change. Editable VCS requirements
+                # are always updated below.
+                source_dir = self._resolve_local_source_dir(can)
+                if source_dir is not None and self._local_build_is_current(dist, source_dir, editable=True):
+                    return False
             return True
         if is_editable(dist):  # only update editable if no_editable is True
             return bool(self.no_editable)
@@ -161,12 +241,19 @@ class BaseSynchronizer:
             if not isinstance(dreq, FileRequirement):
                 return True
             url = dreq.get_full_url()
-            if dreq.is_local_dir:
-                # We don't know whether a local dir has been changed, always update
-                return True
             assert can.link is not None
-            if url != backend.expand_line(can.link.url_without_fragment):
+            expanded_url = backend.expand_line(can.link.url_without_fragment)
+            if url != expanded_url:
                 return True
+            if dreq.is_local_dir:
+                # Decide from the digest of the local build inputs instead of
+                # rebuilding unconditionally.
+                source_dir = self._resolve_local_source_dir(can)
+                if source_dir is None:
+                    # The source directory is gone, force the update and let
+                    # the build step report the proper error.
+                    return True
+                return not self._local_build_is_current(dist, source_dir, editable=False)
             direct_json = json.loads(content) if (content := dist.read_text("direct_url.json")) else None
             if not direct_json or "archive_info" not in direct_json:
                 # We are not able to check, don't update

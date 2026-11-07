@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
 from pdm.exceptions import BuildError
 from pdm.installers.base import BaseSynchronizer, editables_candidate
-from pdm.models.candidates import Candidate
+from pdm.models.candidates import LOCAL_BUILD_RECORD_FILE, Candidate
 from pdm.models.requirements import parse_requirement
 
 
@@ -162,6 +163,109 @@ def test_should_update_unknown_direct_requirement(mocker):
     candidate.req.editable = False
 
     assert synchronizer._should_update(mocker.Mock(), candidate)
+
+
+def _local_dir_synchronizer(mocker, tmp_path, *, editable=False):
+    synchronizer = make_synchronizer(mocker)
+    mocker.patch("pdm.installers.base.is_editable", return_value=editable)
+    candidate = mocker.Mock()
+    candidate.req.is_named = False
+    candidate.req.editable = editable
+    candidate.req.is_vcs = False
+    candidate.link.url_without_fragment = tmp_path.as_uri()
+    mocker.patch.object(synchronizer, "_resolve_local_source_dir", return_value=tmp_path)
+    installed_req = mocker.Mock()
+    installed_req.is_local_dir = True
+    installed_req.get_full_url.return_value = tmp_path.as_uri()
+    mocker.patch("pdm.installers.base.Requirement.from_dist", return_value=installed_req)
+    mocker.patch("pdm.installers.base.FileRequirement", type(installed_req))
+    return synchronizer, candidate
+
+
+def _record(mocker, digest="sha256=abc"):
+    dist = mocker.Mock()
+    dist.read_text.side_effect = lambda name: (
+        json.dumps({"version": 1, "digest": digest}) if name == LOCAL_BUILD_RECORD_FILE else None
+    )
+    existing = mocker.Mock()
+    existing.exists.return_value = True
+    dist.files = [mocker.Mock()]
+    dist.locate_file.return_value = existing
+    return dist
+
+
+def test_local_dir_unchanged_is_not_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+    dist = _record(mocker)
+
+    assert synchronizer._should_update(dist, candidate) is False
+
+
+def test_local_dir_without_record_is_updated_once(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+    dist = mocker.Mock()
+    dist.read_text.return_value = None  # distribution installed before digest tracking
+
+    assert synchronizer._should_update(dist, candidate) is True
+
+
+def test_local_dir_changed_inputs_are_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=new")
+
+    assert synchronizer._should_update(_record(mocker), candidate) is True
+
+
+def test_local_dir_stale_record_version_is_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+    dist = mocker.Mock()
+    dist.read_text.side_effect = lambda name: (
+        json.dumps({"version": 0, "digest": "sha256=abc"}) if name == LOCAL_BUILD_RECORD_FILE else None
+    )
+
+    assert synchronizer._should_update(dist, candidate) is True
+
+
+def test_local_dir_missing_artifact_is_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+    dist = _record(mocker)
+    dist.locate_file.return_value.exists.return_value = False
+
+    assert synchronizer._should_update(dist, candidate) is True
+
+
+def test_local_dir_missing_source_is_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    mocker.patch.object(synchronizer, "_resolve_local_source_dir", return_value=None)
+
+    assert synchronizer._should_update(_record(mocker), candidate) is True
+
+
+def test_editable_local_dir_unchanged_is_not_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path, editable=True)
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+
+    assert synchronizer._should_update(_record(mocker), candidate) is False
+
+
+def test_editable_vcs_is_always_updated(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path, editable=True)
+    candidate.req.is_vcs = True
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+
+    assert synchronizer._should_update(_record(mocker), candidate) is True
+
+
+def test_reinstall_bypasses_local_digest(mocker, tmp_path):
+    synchronizer, candidate = _local_dir_synchronizer(mocker, tmp_path)
+    synchronizer.reinstall = True
+    mocker.patch("pdm.installers.base.compute_local_build_digest", return_value="sha256=abc")
+
+    assert synchronizer._should_update(_record(mocker), candidate) is True
 
 
 def test_self_key_preserves_empty_project_name(mocker):

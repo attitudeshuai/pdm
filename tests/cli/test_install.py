@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from pdm.cli import actions
@@ -241,6 +243,92 @@ def test_install_monorepo_with_rel_paths(fixture_project, pdm, working_set):
         pdm(["install"], obj=project, strict=True)
     for package in ("package-a", "package-b", "core"):
         assert package in working_set
+
+
+def _create_local_package(project, dist_name: str, content: str) -> None:
+    module = dist_name.replace("-", "_")
+    pkg_dir = project.root / "packages" / module
+    (pkg_dir / module).mkdir(parents=True)
+    (pkg_dir / "pyproject.toml").write_text(
+        f'[project]\nname = "{dist_name}"\nversion = "0.1.0"\nrequires-python = ">=3.7"\n\n'
+        '[build-system]\nrequires = ["pdm-backend"]\nbuild-backend = "pdm.backend"\n',
+        encoding="utf-8",
+    )
+    (pkg_dir / module / "__init__.py").write_text(content, encoding="utf-8")
+
+
+def _snapshot_local_packages(project):
+    purelib = Path(project.environment.get_paths()["purelib"])
+    snapshot: dict[str, tuple] = {}
+    for module in ("pkg_a", "pkg_b"):
+        files = [
+            *list((purelib / module).glob("*.py")),
+            *list((purelib / f"{module}-0.1.0.dist-info").iterdir()),
+        ]
+        snapshot[module] = {str(f.relative_to(purelib)): (f.stat().st_mtime_ns, f.stat().st_size) for f in files}
+    return purelib, snapshot
+
+
+def test_local_dependencies_are_built_only_when_inputs_change(project, pdm, local_finder, mocker):
+    from pdm.builders import WheelBuilder
+
+    _create_local_package(project, "pkg-a", 'VALUE = "v1"\n')
+    _create_local_package(project, "pkg-b", 'VALUE = "v1"\n')
+    project.add_dependencies(
+        [
+            "pkg-a @ file:///${PROJECT_ROOT}/packages/pkg_a",
+            "pkg-b @ file:///${PROJECT_ROOT}/packages/pkg_b",
+        ]
+    )
+    pdm(["lock"], obj=project, strict=True)
+
+    builder_spy = mocker.patch("pdm.models.candidates.WheelBuilder", wraps=WheelBuilder)
+    result = pdm(["--no-cache", "install"], obj=project, strict=True)
+    assert result.exit_code == 0
+    built_roots = {Path(args[0]).name for args, _ in builder_spy.call_args_list}
+    assert {"pkg_a", "pkg_b"} <= built_roots
+
+    purelib, snapshot = _snapshot_local_packages(project)
+    for module in ("pkg_a", "pkg_b"):
+        record = purelib / f"{module}-0.1.0.dist-info" / "pdm_build_inputs.json"
+        assert record.is_file()
+
+    # Second install with no changes: no local package is rebuilt and the
+    # installed files are not touched.
+    builder_spy = mocker.patch("pdm.models.candidates.WheelBuilder", wraps=WheelBuilder)
+    result = pdm(["--no-cache", "install"], obj=project, strict=True)
+    assert "nothing to do" in result.output
+    assert builder_spy.call_count == 0
+    _, second_snapshot = _snapshot_local_packages(project)
+    assert second_snapshot == snapshot
+
+    # Change only pkg-a inputs: that package alone is rebuilt/reinstalled
+    # while pkg-b stays on disk.
+    (project.root / "packages/pkg_a/pkg_a/__init__.py").write_text('VALUE = "v2"\n', encoding="utf-8")
+    builder_spy = mocker.patch("pdm.models.candidates.WheelBuilder", wraps=WheelBuilder)
+    result = pdm(["--no-cache", "install"], obj=project, strict=True)
+    assert result.exit_code == 0
+    assert "1 to update" in result.output
+    built_roots = [Path(args[0]).name for args, _ in builder_spy.call_args_list]
+    assert built_roots == ["pkg_a"]
+    assert "v2" in (purelib / "pkg_a/__init__.py").read_text(encoding="utf-8")
+    _, third_snapshot = _snapshot_local_packages(project)
+    # pkg_b is byte-for-byte untouched, pkg_a changed.
+    assert third_snapshot["pkg_b"] == snapshot["pkg_b"]
+    assert third_snapshot["pkg_a"] != snapshot["pkg_a"]
+
+    # A distribution without a digest record (e.g. installed by an older PDM)
+    # is rebuilt once, the digest is stored, and the following run skips it.
+    (purelib / "pkg_b-0.1.0.dist-info" / "pdm_build_inputs.json").unlink()
+    builder_spy = mocker.patch("pdm.models.candidates.WheelBuilder", wraps=WheelBuilder)
+    result = pdm(["--no-cache", "install"], obj=project, strict=True)
+    assert "1 to update" in result.output
+    assert [Path(args[0]).name for args, _ in builder_spy.call_args_list] == ["pkg_b"]
+    assert (purelib / "pkg_b-0.1.0.dist-info" / "pdm_build_inputs.json").is_file()
+    builder_spy = mocker.patch("pdm.models.candidates.WheelBuilder", wraps=WheelBuilder)
+    result = pdm(["--no-cache", "install"], obj=project, strict=True)
+    assert "nothing to do" in result.output
+    assert builder_spy.call_count == 0
 
 
 @pytest.mark.usefixtures("repository")

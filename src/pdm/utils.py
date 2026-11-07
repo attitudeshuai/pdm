@@ -8,6 +8,7 @@ import atexit
 import contextlib
 import errno
 import functools
+import hashlib
 import importlib.metadata
 import inspect
 import json
@@ -228,6 +229,81 @@ def cd(path: str | Path) -> Iterator:
         yield
     finally:
         os.chdir(_old_cwd)
+
+
+#: Directory names that never count as local build inputs. They hold VCS
+#: metadata, interpreter/tool caches, virtual environments or in-tree build
+#: artifacts, so changes inside them must not invalidate the build digest.
+HASH_IGNORED_DIR_NAMES = frozenset(
+    {
+        # VCS metadata
+        ".git",
+        ".hg",
+        ".svn",
+        "_darcs",
+        ".bzr",
+        "cvs",
+        # Python and tool caches
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        # in-tree build artifacts
+        "build",
+        "dist",
+        ".eggs",
+        ".pdm-build",
+        "pip-wheel-metadata",
+        "target",
+        # virtual environments
+        ".venv",
+        "venv",
+        "env",
+    }
+)
+
+#: File suffixes that never count as local build inputs.
+HASH_IGNORED_FILE_SUFFIXES = (".pyc", ".pyo")
+
+
+def hash_directory_tree(root: str | Path, digest_name: str = "sha256") -> str:
+    """Compute a deterministic digest over the *contents* of a directory.
+
+    Regular files are visited in a sorted order and each of them contributes
+    its POSIX-style relative path together with its bytes, so that renaming
+    or editing a file changes the digest. File permissions, ownership and
+    timestamps are deliberately not included, hence touching only those
+    attributes leaves the digest untouched. VCS metadata, caches and in-tree
+    build artifacts are skipped (see :data:`HASH_IGNORED_DIR_NAMES`).
+
+    :returns: ``"<digest_name>=<hexdigest>"``
+    """
+    hasher = hashlib.new(digest_name)
+
+    def walk(directory: str, prefix: str) -> None:
+        with os.scandir(directory) as scan:
+            entries = sorted(scan, key=lambda entry: entry.name)
+        for entry in entries:
+            rel_name = entry.name if not prefix else f"{prefix}{entry.name}"
+            if entry.is_dir(follow_symlinks=False):
+                lowered = entry.name.lower()
+                if lowered in HASH_IGNORED_DIR_NAMES or lowered.endswith(".egg-info"):
+                    continue
+                walk(entry.path, f"{rel_name}/")
+            elif entry.is_file():  # follows symlinks that point to a file
+                if entry.name.lower().endswith(HASH_IGNORED_FILE_SUFFIXES):
+                    continue
+                hasher.update(rel_name.encode("utf-8"))
+                hasher.update(b"\0")
+                with open(entry.path, "rb") as fp:
+                    for chunk in iter(lambda: fp.read(65536), b""):
+                        hasher.update(chunk)
+                hasher.update(b"\0")
+
+    walk(os.fspath(root), "")
+    return f"{digest_name}={hasher.hexdigest()}"
 
 
 def url_to_path(url: str) -> str:
